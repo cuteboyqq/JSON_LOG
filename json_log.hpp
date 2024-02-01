@@ -38,20 +38,33 @@ using namespace std;
 class JSON_LOG
 {
 public:
+	JSON_LOG(std::string file);
+	~JSON_LOG();
 	// Return LOG String with JSON format
 	std::string JsonLogString(ADAS_Results adasResult,
-						ADAS_Config_S* m_config,
-						std::vector<BoundingBox> boundingBoxLists[],
-						std::vector<Object> m_trackedObjList,
-						int m_frameIdx);
+							  ADAS_Config_S* m_config,
+							  std::vector<BoundingBox> boundingBoxLists[],
+							  std::vector<Object> m_trackedObjList,
+							  int m_frameIdx);
+
+	void SaveJsonLogFile(std::string jsonString);
+
+	std::string GetJsonValueByKey(int targetFrameID);
+
+	std::string GetJSONFile();
+
 private:
 	//Show log on terminal
-	bool ShowJsonLog = false;
+	bool ShowJsonLog = true;
 
 	//Enable save log type
 	bool SaveTrackObjLog = true;
-	bool SaveLaneInfo = true;
+	bool SaveLaneInfoLog = true;
 	bool SaveDetObjLog = true;
+	bool SaveVanishLineLog = true;
+	bool SaveToJSONFile = true;
+	std::string jsonString;
+	std::string jsonFile;
 };
 
 #endif

@@ -16,12 +16,11 @@
 #ifdef QCS6490
 #include "adas.hpp"
 #endif
-using json = nlohmann::json;
+
 #ifdef SAV837
 #include "wnc_adas.hpp"
 #define WNC_DEBUG_INFO 0
 
-// int frameID = 1;
 // === SGS Libraries === //
 // #include "iout.h"
 #include "mi_ipu.h"
@@ -70,6 +69,7 @@ ADAS::ADAS(std::string configPath)
     m_logger->set_level(spdlog::level::info);
 
 	// Enable YOLO-ADAS thread
+	m_opticalFlow->runThread();
 	m_yoloADAS->runThread();
 	m_yoloADAS_PostProc->runThread();
 };
@@ -121,6 +121,7 @@ ADAS::ADAS(IPU_DlaInfo_S& stDlaInfo) : CIpuCommon(stDlaInfo)
         m_logger->set_level(spdlog::level::info);
 
 	// Enable YOLO-ADAS thread
+	m_opticalFlow->runThread();
 	m_yoloADAS->runThread();
 	m_yoloADAS_PostProc->runThread();
 };
@@ -140,7 +141,8 @@ ADAS::~ADAS()
 	delete m_humanTracker;
 	delete m_riderTracker;
 	delete m_vehicleTracker;
-	delete m_laneLineDet;
+	delete m_opticalFlow;
+	delete m_laneFinder;
 	delete m_ldw;
 	delete m_fcw;
 	delete m_OD_ROI;
@@ -153,7 +155,8 @@ ADAS::~ADAS()
 	m_humanTracker = nullptr;
 	m_riderTracker = nullptr;
 	m_vehicleTracker = nullptr;
-	m_laneLineDet = nullptr;
+	m_opticalFlow = nullptr;
+	m_laneFinder = nullptr;
 	m_ldw = nullptr;
 	m_fcw = nullptr;
 	m_OD_ROI = nullptr;
@@ -162,6 +165,10 @@ ADAS::~ADAS()
 
 void ADAS::stopThread()
 {
+	// Stop processing threads
+	cout << "m_opticalFlow->stopThread()" << endl;
+	m_opticalFlow->stopThread();
+
 	cout << "m_yoloADAS_PostProc->stopThread()" << endl;
 	m_yoloADAS_PostProc->stopThread();
 
@@ -296,12 +303,16 @@ bool ADAS::_init(std::string configPath)
 	m_focalRescaleRatio = (float)m_videoHeight / (float)m_modelHeight;
 	#endif
 
+	// Optical Flow
+	m_opticalFlow = new OpticalFlow(m_config);
+	cout << "[ADAS::_init] << Initialized Optical Flow module" << endl;
+
 	// Vanishing Line
 	m_yVanish = m_config->yVanish;
 
-	// Lane Line Detection
-	m_laneLineDet = new LaneLineDetection(m_config);
-	cout << "[ADAS::_init] << Initialized Lane Line Detection module" << endl;
+	// Lane Finder
+	m_laneFinder = new LaneFinder(m_config);
+	cout << "[ADAS::_init] << Initialized Lane Finder module" << endl;
 
 	// Lane Departure Warning
 	m_ldw = new LDW(m_config);
@@ -369,10 +380,25 @@ bool ADAS::_readDebugConfig()
 		m_yoloADAS_PostProc->debugON(showMask);
 	}
 
+	if (m_config->stDebugConfig.opticalFlow)
+	{
+		m_dbg_opticalFlow = true;
+		m_opticalFlow->debugON();
+	}
+
+	if (m_config->stDebugConfig.laneLineCalib)
+	{
+		m_dbg_laneLineCalib = true;
+
+		bool showMask = m_config->stDisplayConfig.laneLineMask;
+		// m_yoloADAS->m_laneLineCalib->debugON(showMask);
+		m_yoloADAS_PostProc->m_laneLineCalib->debugON(showMask);
+	}
+
 	if (m_config->stDebugConfig.laneLineDetection)
 	{
 		m_dbg_laneLineDetection = true;
-		m_laneLineDet->debugON();
+		m_laneFinder->debugON();
 	}
 
 	if (m_config->stDebugConfig.objectDetection)
@@ -495,8 +521,15 @@ bool ADAS::_readShowProcTimeConfig()
 		m_yoloADAS_PostProc->showProcTime();
 	}
 
+	if (m_config->stShowProcTimeConfig.laneLineCalib)
+		// m_yoloADAS->m_laneLineCalib->showProcTime();
+		m_yoloADAS_PostProc->m_laneLineCalib->showProcTime();
+
 	if (m_config->stShowProcTimeConfig.laneFinder)
-		m_laneLineDet->showProcTime();
+		m_laneFinder->showProcTime();
+
+	if (m_config->stShowProcTimeConfig.opticalFlow)
+		m_opticalFlow->showProcTime();
 
 	if (m_config->stShowProcTimeConfig.objectTracking)
 	{
@@ -601,7 +634,152 @@ bool ADAS::_initROI()
 //                   Main
 // ============================================
 //#ifdef QCS6490
+bool ADAS::run(cv::Mat &imgFrame)
+{
+	auto m_logger = spdlog::get("ADAS");
+	auto time_0 = std::chrono::high_resolution_clock::now();
+	auto time_1 = std::chrono::high_resolution_clock::now();
 
+	bool ret = ADAS_SUCCESS;
+
+	if (imgFrame.empty())
+	{
+		m_logger->warn("Input image is empty");
+		return false;
+	}
+
+	// Get Image Frame
+	if (m_dsp_results)
+		m_dsp_img = imgFrame.clone();
+		
+	// Entry Point
+	if (m_frameIdx % m_frameStep == 0)
+	{
+		m_logger->info("");
+		m_logger->info("========================================");
+		m_logger->info("Frame Index: {}", m_frameIdx);
+		m_logger->info("========================================");
+
+		// Get Image Frame
+		m_img = imgFrame.clone();
+
+		// Calculate Ego Direction Information
+		if (!_calcEgoDirection())
+		{
+		m_logger->warn("Calculate ego direction failed ...");
+		ret = ADAS_FAILURE;
+		}
+
+		// AI Inference
+		if (!_modelInfernece())
+		{
+		m_logger->error("AI model inference failed ... STOP ADAS");
+		ret = ADAS_FAILURE;
+		exit(1);
+		}
+
+		// Get Lane Line Masks
+		if (!_getLaneLineMasks())
+		{
+		m_logger->warn("Get lane line mask failed ...");
+		ret = ADAS_FAILURE;
+		}
+
+		// Lane Line Detection
+		if (!_laneLineDetection())
+		{
+		m_logger->warn("Detect lane lines failed ...");
+		ret = ADAS_FAILURE;
+		}
+
+		// Get Detected Bounding Boxes
+		if (!_objectDetection())
+		{
+		m_logger->warn("Detect objects failed ...");
+		ret = ADAS_FAILURE;
+		}
+
+		// Object Tracking
+		if (!_objectTracking())
+		{
+		m_logger->warn("Track objects failed ...");
+		ret = ADAS_FAILURE;
+		}
+
+		// Detect Lane Departure Event
+		if (!_laneDepartureDetection())
+		{
+		m_logger->warn("Detect lane departure event failed ...");
+		ret = ADAS_FAILURE;
+		}
+
+		// Forward Collision Warning
+		if (!_forwardCollisionDetection())
+		{
+		m_logger->warn("Detect forward collision event failed ...");
+		ret = ADAS_FAILURE;
+		}
+
+		// Show Results
+		_showDetectionResults();
+
+		// Save Results to Debug Logs
+		if (m_dbg_saveLogs)
+		_saveDetectionResults();
+
+		if (m_estimateTime)
+		{
+		time_1 = std::chrono::high_resolution_clock::now();
+		m_logger->info("");
+		m_logger->info("Processing Time: \t{} ms",
+						std::chrono::duration_cast<std::chrono::nanoseconds>(time_1 - time_0).count()
+						/ (1000.0 * 1000));
+		}
+	}
+
+	// Draw and Save Results
+	if (m_dsp_results && ret == ADAS_SUCCESS)
+		_drawResults();
+
+	if (m_dsp_results && m_dbg_saveImages && ret == ADAS_SUCCESS)
+		_saveDrawResults();
+
+	// Save Raw Images
+	if (m_dbg_saveRawImages)
+		_saveRawImages();
+
+	
+
+	// Update frame index
+	_updateFrameIndex();
+
+	// ADAS Log with JSON format
+	ADAS_Results adasResult;
+	getResults(adasResult);
+	//"{"frameId": id, "pLeftFar.x": adasResult.pLeftFar.x, }"
+	std::vector<BoundingBox> boundingBoxLists[] =
+	{
+		m_humanBBoxList,
+		m_riderBBoxList,
+		m_vehicleBBoxList,
+		m_roadSignBBoxList,
+		m_stopSignBBoxList
+	};
+	JSON_LOG json_log("output.json");
+	std::string json_log_str = json_log.JsonLogString(adasResult, 
+													  m_config, 
+													  boundingBoxLists, 
+													  m_trackedObjList, 
+													  m_frameIdx);
+	
+	std::string json_log_frameID_str = json_log.GetJsonValueByKey(87);
+	// cout<<"==========================================================================="<<endl;
+	// cout<<json_log_str<<endl;
+	// cout<<"==========================================================================="<<endl;
+	return ret;
+}
+#if 1
+// For CES demo, m_dsp_results is always True
 bool ADAS::run(cv::Mat &imgFrame, cv::Mat &resultMat)
 {
  	auto m_logger = spdlog::get("ADAS");
@@ -643,7 +821,15 @@ bool ADAS::run(cv::Mat &imgFrame, cv::Mat &resultMat)
 		cv::resize(m_img, m_img, cv::Size(m_config->modelWidth, m_config->modelHeight), cv::INTER_LINEAR);
 
 		// Update YOLO-ADAS frame buffer
+		m_opticalFlow->updateInputFrame(m_img);
 		m_yoloADAS->updateInputFrame(m_img);
+
+		// Calculate Ego Direction Information
+		if (!_calcEgoDirection())
+		{
+			m_logger->warn("Calculate ego direction failed ...");
+			ret = ADAS_FAILURE;
+		}
 
 		// Get last prediction
 		YOLOADAS_Prediction pred;
@@ -663,7 +849,14 @@ bool ADAS::run(cv::Mat &imgFrame, cv::Mat &resultMat)
 			}
 
 			{
-				// Get Detected Lane Line Bounding Boxes
+				// Get Lane Line Masks
+				if (!_getLaneLineMasks())
+				{
+					m_logger->warn("Get lane line mask failed ...");
+					ret = ADAS_FAILURE;
+				}
+
+				// Lane Line Detection
 				if (!_laneLineDetection())
 				{
 					m_logger->warn("Detect lane lines failed ...");
@@ -748,18 +941,20 @@ bool ADAS::run(cv::Mat &imgFrame, cv::Mat &resultMat)
 		m_roadSignBBoxList,
 		m_stopSignBBoxList
 	};
-	JSON_LOG json_log;
+	JSON_LOG json_log("output.json");
 	std::string json_log_str = json_log.JsonLogString(adasResult, 
 													  m_config, 
 													  boundingBoxLists, 
 													  m_trackedObjList, 
 													  m_frameIdx);
-	cout<<"==========================================================================="<<endl;
-	cout<<json_log_str<<endl;
-	cout<<"==========================================================================="<<endl;
+	// std::string json_log_frameID_str = json_log.GetJsonValueByKey(87);
+	// cout<<"==========================================================================="<<endl;
+	// cout<<json_log_str<<endl;
+	// cout<<"==========================================================================="<<endl;
 
 	return ret;
 }
+#endif
 //#endif
 
 #ifdef SAV837
@@ -826,6 +1021,12 @@ void WNC_ADAS::IpuRunProcess()
                 m_logger->debug("Frame Index: {}", m_frameIdx_wnc);
                 m_logger->debug("========================================");
 
+                // Calculate Ego Direction Info
+                if (!_calcEgoDirection())
+                {
+                    m_logger->warn("Calculate ego direction failed ...");
+                    FRAME_SUCCESS = ADAS_FAILURE;
+                }
 
 				// Update YOLO-ADAS frame buffer
 				m_yoloADAS->updateInputFrame(m_img);
@@ -840,7 +1041,14 @@ void WNC_ADAS::IpuRunProcess()
 
 					// Start doing post processing ...
 					m_yoloADAS_PostProc->run(pred);
-			
+
+					// Get Lane Line Masks
+					if (!_getLaneLineMasks())
+					{
+						m_logger->warn("Get lane line mask failed ...");
+						FRAME_SUCCESS = ADAS_FAILURE;
+					}
+
 					// Lane Line Detection
 					if (!_laneLineDetection())
 					{
@@ -1042,6 +1250,46 @@ bool WNC_ADAS::_scaleToModelSize(MI_SYS_BufInfo_t* pstBufInfo)
 }
 #endif
 
+bool ADAS::_calcEgoDirection()
+{
+	auto m_logger = spdlog::get("ADAS");
+
+	bool isReady = false;
+
+	if (m_opticalFlow->isProcessDone())
+	{
+		std::vector<BoundingBox> bboxList;
+
+		bboxList.insert(bboxList.end(), m_humanBBoxList.begin(), m_humanBBoxList.end());
+		bboxList.insert(bboxList.end(), m_riderBBoxList.begin(), m_riderBBoxList.end());
+		bboxList.insert(bboxList.end(), m_vehicleBBoxList.begin(), m_vehicleBBoxList.end());
+		m_opticalFlow->getFlow(bboxList);
+		m_opticalFlow->getDirectionInfo(m_egoDirectionInfo);
+		m_opticalFlow->getDirection(m_egoDirectionInfo);
+
+		// Update Ego Direction to Lane Line Calibration
+		m_yoloADAS_PostProc->m_laneLineCalib->updateEgoDirection(m_egoDirectionInfo.directionStr);
+	}
+
+	return ADAS_SUCCESS;
+}
+
+bool ADAS::_getLaneLineMasks()
+{
+	auto m_logger = spdlog::get("ADAS");
+
+	m_laneMask = m_procResult.laneMask;
+	m_horiLineMask = m_procResult.horiLineMask;
+	m_laneLineInfo = m_procResult.laneLineInfo;
+
+	if (m_dsp_laneLineMask)
+	{
+		m_dsp_colorLaneMask = m_procResult.colorLaneMask;
+		m_dsp_colorLineMask = m_procResult.colorLineMask;
+	}
+
+	return ADAS_SUCCESS;
+}
 
 bool ADAS::_modelInfernece()
 {
@@ -1053,7 +1301,48 @@ bool ADAS::_modelInfernece()
 	return ADAS_SUCCESS;
 }
 
-//TODO: @QuangDao, we need to implement a new LDW
+bool ADAS::_laneLineDetection()
+{
+	auto m_logger = spdlog::get("ADAS");
+
+	m_currLaneInfo = m_laneFinder->find(m_laneMask, m_laneLineInfo);
+	m_unscale_currLaneInfo = m_laneFinder->getUnscaleLaneInfo();
+	m_laneFinder->setHoriLineMask(m_horiLineMask);
+	m_laneFinder->getLinePointList(m_linePointList);
+	m_laneFinder->updateEgoDirection(m_egoDirectionInfo.directionStr);
+
+	m_isDetectLine = m_laneFinder->isDetectLine();
+
+	if (m_dsp_laneLineDetection)
+		m_dsp_mergeLineMask = m_procResult.mergeLineMask;
+
+	// Update Vanish Line Y when detect lane lines
+	int tmpVanishY = m_laneFinder->getVanishY();
+
+	if (tmpVanishY != 0)
+	{
+		m_yVanish = tmpVanishY;
+		m_yVanish = std::round(m_yVanish * m_focalRescaleRatio);
+	}
+
+	if (m_isDetectLine)
+	{
+		// Update Detection Zone
+		m_fcw->setZone(m_currLaneInfo);
+		m_fcw->updateDefaultZone(m_currLaneInfo);
+	}
+	else
+	{
+		m_fcw->useDefaultZone();
+	}
+
+	// Debug Logs
+	m_logger->debug("Detect lane lines = {}", m_isDetectLine);
+	m_logger->debug("Y of vanishing line = {}", m_yVanish);
+
+	return ADAS_SUCCESS;
+}
+
 bool ADAS::_laneDepartureDetection()
 {
 	auto m_logger = spdlog::get("ADAS");
@@ -1072,16 +1361,17 @@ bool ADAS::_laneDepartureDetection()
 		// LineInfo leftLine = m_yoloADAS_PostProc->m_laneLineCalib->m_leftLineInfo;
 		// LineInfo rightLine = m_yoloADAS_PostProc->m_laneLineCalib->m_rightLineInfo;
 
-		// m_isLeftLineShift = m_procResult.isLeftLineShift;
-		// m_isRightLineShift = m_procResult.isRightLineShift;
-		// m_leftLineShiftRatio = m_procResult.leftLineShiftRatio;
-		// m_rightLineShiftRatio = m_procResult.rightLineShiftRatio;
-		// LineInfo leftLine = m_procResult.leftLine;
-		// LineInfo rightLine = m_procResult.rightLine;
+		m_isLeftLineShift = m_procResult.isLeftLineShift;
+		m_isRightLineShift = m_procResult.isRightLineShift;
+		m_leftLineShiftRatio = m_procResult.leftLineShiftRatio;
+		m_rightLineShiftRatio = m_procResult.rightLineShiftRatio;
+		LineInfo leftLine = m_procResult.leftLine;
+		LineInfo rightLine = m_procResult.rightLine;
 
 		m_ldw->enable();
-		// m_isLaneDeparture = m_ldw->run(m_currLaneInfo, m_laneLineInfo, m_roadSignBBoxList, m_linePointList,
-		// 													m_egoDirectionInfo.directionStr);
+        m_isLaneDeparture =
+            m_ldw->run(m_unscale_currLaneInfo, leftLine, rightLine, m_laneLineInfo, m_roadSignBBoxList, m_linePointList,
+                       m_egoDirectionInfo.directionStr, m_leftLineShiftRatio, m_rightLineShiftRatio);
 	}
 	else
 	{
@@ -1110,107 +1400,6 @@ bool ADAS::_laneDepartureDetection()
 	return ADAS_SUCCESS;
 }
 
-
-bool ADAS::_laneLineDetection()
-{
-	auto m_logger = spdlog::get("ADAS");
-	m_vlaBBoxList = m_procResult.vlaBBoxList;
-	m_vpaBBoxList = m_procResult.vpaBBoxList;
-	m_dlaBBoxList = m_procResult.dlaBBoxList;
-	m_dmaBBoxList = m_procResult.dmaBBoxList;
-	m_duaBBoxList = m_procResult.duaBBoxList;
-	m_dcaBBoxList = m_procResult.dcaBBoxList;
-
-	// Debug Logs
-	m_logger->debug("Num of VLA Bounding Box: {} / {}",
-	(int)m_humanBBoxList.size(), (int)m_f_humanBBoxList.size());
-
-	m_logger->debug("Num of VPA Bounding Box: {} / {}",
-	(int)m_riderBBoxList.size(), (int)m_f_riderBBoxList.size());
-
-	m_logger->debug("Num of DLA Bounding Box: {} / {}",
-	(int)m_vehicleBBoxList.size(), (int)m_f_vehicleBBoxList.size());
-
-	m_logger->debug("Num of DMA Bounding Box: {} / {}",
-	(int)m_roadSignBBoxList.size(), (int)m_roadSignBBoxList.size());
-
-	m_logger->debug("Num of DUA Bounding Box: {} / {}",
-	(int)m_stopSignBBoxList.size(), (int)m_stopSignBBoxList.size());
-
-	m_logger->debug("Num of DCA Bounding Box: {} / {}",
-	(int)m_stopSignBBoxList.size(), (int)m_stopSignBBoxList.size());
-
-	//
-	LaneLineBoxes laneLineBox = {};
-	laneLineBox.vlaBBoxList.insert(laneLineBox.vlaBBoxList.end(), m_vlaBBoxList.begin(), m_vlaBBoxList.end());
-	laneLineBox.vpaBBoxList.insert(laneLineBox.vpaBBoxList.end(), m_vpaBBoxList.begin(), m_vpaBBoxList.end());
-	laneLineBox.duaBBoxList.insert(laneLineBox.duaBBoxList.end(), m_duaBBoxList.begin(), m_duaBBoxList.end());
-	laneLineBox.dmaBBoxList.insert(laneLineBox.dmaBBoxList.end(), m_dmaBBoxList.begin(), m_dmaBBoxList.end());
-	laneLineBox.dlaBBoxList.insert(laneLineBox.dlaBBoxList.end(), m_dlaBBoxList.begin(), m_dlaBBoxList.end());
-	laneLineBox.dcaBBoxList.insert(laneLineBox.dcaBBoxList.end(), m_dcaBBoxList.begin(), m_dcaBBoxList.end());
-
-	//
-	m_currLaneInfo = m_laneLineDet->find(laneLineBox, m_laneLineInfo);
-	m_isDetectLine = m_laneLineDet->isDetectLine();
-	m_logger->debug("pLeftCarhood = ({}, {})", m_currLaneInfo.pLeftCarhood.x, m_currLaneInfo.pLeftCarhood.y);
-	m_logger->debug("pLeftFar = ({}, {})", m_currLaneInfo.pLeftFar.x, m_currLaneInfo.pLeftFar.y);
-	m_logger->debug("pRightCarhood = ({}, {})", m_currLaneInfo.pRightCarhood.x, m_currLaneInfo.pRightCarhood.y);
-	m_logger->debug("pRightFar = ({}, {})", m_currLaneInfo.pRightFar.x, m_currLaneInfo.pRightFar.x);
-	m_logger->debug("pLeftDegree = ({})", m_currLaneInfo.leftDegree);
-	m_logger->debug("pRightDegree = ({})", m_currLaneInfo.rightDegree);
-
-	// Update Vanish Line Y when detect lane lines
-	int tmpVanishY = m_laneLineDet->getVanishY();
-	if (tmpVanishY != 0)
-	{
-		m_yVanish = tmpVanishY;
-		m_yVanish = std::round(m_yVanish * m_focalRescaleRatio);
-	}
-
-	m_fcw->setDetectLines(m_isDetectLine);
-
-	if (m_isDetectLine)
-	{
-		// Update Detection Zone
-		m_fcw->setZone(m_currLaneInfo);
-		m_fcw->updateDefaultZone(m_currLaneInfo);
-
-		// Direction Vector
-		vector<cv::Point> dirVec(2);
-		utils::rescalePoint(
-				m_laneLineInfo.drivingDirectionVector[0], dirVec[0],
-				m_config->modelWidth, m_config->modelHeight,
-				m_videoWidth, m_videoHeight);
-
-		utils::rescalePoint(
-				m_laneLineInfo.drivingDirectionVector[1], dirVec[1],
-				m_config->modelWidth, m_config->modelHeight,
-				m_videoWidth, m_videoHeight);
-
-		m_fcw->setLaneDirectionVector(dirVec[1], dirVec[0]);
-
-		// Vanish line
-		m_fcw->setVanishLine(m_yVanish);
-
-		// Lane Head Boundary
-		m_fcw->setLaneHeadBoundary(m_currLaneInfo.pLeftFar.x, m_currLaneInfo.pRightFar.x);
-	}
-	else
-	{
-		//
-		LaneInfo pseudoLaneInfo = {};
-		m_laneLineDet->getPseudoLaneInfo(pseudoLaneInfo);
-		m_fcw->setZone(pseudoLaneInfo);
-	}
-
-	// Debug Logs
-	m_logger->debug("Detect lane lines = {}", m_isDetectLine);
-	m_logger->debug("Y of vanishing line = {}", m_yVanish);
-
-	return ADAS_SUCCESS;
-}
-
-
 bool ADAS::_objectDetection()
 {
 	auto m_logger = spdlog::get("ADAS");
@@ -1220,24 +1409,6 @@ bool ADAS::_objectDetection()
 	m_roadSignBBoxList = m_procResult.roadSignBBoxList;
 	m_stopSignBBoxList = m_procResult.stopSignBBoxList;
 
-	//
-	if (!m_isDetectLine && m_fcw->isCarRightAheadCloserThanMeters(m_vehicleBBoxList, 50))
-	{
-		cout << "isCarRightAheadCloserThanMeters" << endl;
-	}
-
-	// if too close to front car, camera cannot see lane line
-	// so we use pseudo lane mask
-	if (m_fcw->isCarAheadCloserThanMeters(m_vehicleBBoxList, 10))
-	{
-		//
-		LaneInfo pseudoLaneInfo = {};
-		m_laneLineDet->getPseudoLaneInfo(pseudoLaneInfo);
-		m_fcw->setZone(pseudoLaneInfo);
-		m_isDetectLine = false;
-	}
-
-	//
 	m_fcw->humanBoxFilter(m_humanBBoxList, m_f_humanBBoxList);
 	m_fcw->riderBoxFilter(m_riderBBoxList, m_f_riderBBoxList);
 	m_fcw->vehicleBoxFilter(m_vehicleBBoxList, m_f_vehicleBBoxList);
@@ -1258,10 +1429,8 @@ bool ADAS::_objectDetection()
 	m_logger->debug("Num of Stop Sign Bounding Box: {} / {}",
 	(int)m_stopSignBBoxList.size(), (int)m_stopSignBBoxList.size());
 
-
 	return ADAS_SUCCESS;
 }
-
 
 bool ADAS::_objectTracking()
 {
@@ -1292,7 +1461,6 @@ bool ADAS::_objectTracking()
 	return ADAS_SUCCESS;
 }
 
-
 bool ADAS::_forwardCollisionDetection()
 {
 	auto m_logger = spdlog::get("ADAS");
@@ -1307,19 +1475,29 @@ bool ADAS::_forwardCollisionDetection()
 // ============================================
 void ADAS::getResults(ADAS_Results &res)
 {
+	//#ifdef QCS6490
+	//Save Lines Result
 	utils::rescaleLine(
-	m_fcw->m_vehicleZone, m_rescaleVehicleZone,
+	m_fcw->m_vehicleZone, m_rescaleVehicleROI,
 	m_config->modelWidth, m_config->modelHeight,
 	m_config->frameWidth, m_config->frameHeight);
+	//#endif
+
+	#ifdef SAV837
+	utils::rescaleLine(
+	m_fcw->m_vehicleZone, m_rescaleVehicleROI,
+	m_config->modelWidth, m_config->modelHeight,
+	m_config->frameWidth, m_config->frameHeight);
+	#endif
 
 	m_result.isDetectLine = m_isDetectLine;
 
-	if (m_rescaleVehicleZone.pLeftFar.y != 0 && m_rescaleVehicleZone.pRightFar.y != 0)
+	if (m_rescaleVehicleROI.pLeftFar.y != 0 && m_rescaleVehicleROI.pRightFar.y != 0)
 	{
-		m_result.pLeftFar = m_rescaleVehicleZone.pLeftFar;
-		m_result.pLeftCarhood = m_rescaleVehicleZone.pLeftCarhood;
-		m_result.pRightFar = m_rescaleVehicleZone.pRightFar;
-		m_result.pRightCarhood = m_rescaleVehicleZone.pRightCarhood;
+		m_result.pLeftFar = m_rescaleVehicleROI.pLeftFar;
+		m_result.pLeftCarhood = m_rescaleVehicleROI.pLeftCarhood;
+		m_result.pRightFar = m_rescaleVehicleROI.pRightFar;
+		m_result.pRightCarhood = m_rescaleVehicleROI.pRightCarhood;
 	}
 
 	// Save Vanishing Line's Y
@@ -1452,6 +1630,16 @@ void ADAS::_saveDetectionResults()
 	m_loggerManager.m_laneMaskLogger->logResult(m_laneLineInfo.laneMaskInfo);
 	m_loggerManager.m_lineMaskLogger->logResult(m_laneLineInfo.lineMaskInfo);
 
+	m_logger->info("");
+	m_logger->info("Lane Mask");
+	m_logger->info("---------------------------------");
+	_saveDetectionResult(m_loggerManager.m_laneMaskLogger->m_logs);
+
+	m_logger->info("");
+	m_logger->info("Line Mask");
+	m_logger->info("---------------------------------");
+	_saveDetectionResult(m_loggerManager.m_lineMaskLogger->m_logs);
+
 	// --- Ego Direction --- //
 	m_loggerManager.m_egoDirectionLogger->logDirectionInfo(m_egoDirectionInfo);
 
@@ -1459,6 +1647,13 @@ void ADAS::_saveDetectionResults()
 	m_logger->info("Ego Direction");
 	m_logger->info("---------------------------------");
 	_saveDetectionResult(m_loggerManager.m_egoDirectionLogger->m_logs);
+
+	// --- Lane Line Calibration --- //
+	m_loggerManager.m_lineCalibrationLogger->logResult(m_laneLineInfo.lineCalibInfo);
+	m_logger->info("");
+	m_logger->info("Line Calibration");
+	m_logger->info("---------------------------------");
+	_saveDetectionResult(m_loggerManager.m_lineCalibrationLogger->m_logs);
 
 	// --- Lane Line Detection --- //
 	m_loggerManager.m_lineDetetionLogger->logReulst(m_currLaneInfo);
@@ -1536,6 +1731,13 @@ void ADAS::_saveRawImages()
 // ============================================
 //               Draw Results
 // ============================================
+void ADAS::_drawLaneDetector()
+{
+  cv::line(m_dsp_img, m_laneDetector.pTailLeft, m_laneDetector.pTailRight, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+  cv::line(m_dsp_img, m_laneDetector.pHeadLeft, m_laneDetector.pHeadRight, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+  cv::line(m_dsp_img, m_laneDetector.pTailLeft, m_laneDetector.pHeadLeft, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+  cv::line(m_dsp_img, m_laneDetector.pTailRight, m_laneDetector.pHeadRight, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+}
 
 void ADAS::_drawLDWROI()
 {
@@ -1543,52 +1745,6 @@ void ADAS::_drawLDWROI()
 	scale_ratio = m_dsp_img.cols / m_segWidth;
 	int middle_x = (int)(m_laneLineInfo.laneMaskInfo.xCenterAdjust * scale_ratio);
 	cv::line(m_dsp_img, cv::Point(middle_x, 0), cv::Point(middle_x, m_dsp_img.rows - 1), cv::Scalar(255, 255, 255), 2);
-}
-
-
-void ADAS::_drawLaneLineBoundingBoxes()
-{
-	std::vector<BoundingBox> boundingBoxLists[] =
-	{
-		// m_vlaBBoxList,
-		// m_vpaBBoxList,
-		m_dlaBBoxList,
-		m_dmaBBoxList,
-		m_duaBBoxList,
-		m_dcaBBoxList
-	};
-
-	cv::Scalar colors[] =
-	{
-		cv::Scalar(204, 0, 102),   // Purple for VLA
-		cv::Scalar(0, 0, 204),     // Red for PCA
-		cv::Scalar(204, 0, 0),     // DLA
-		cv::Scalar(255, 128, 0),   // DMA
-		cv::Scalar(255, 255, 0),   // DUA
-		cv::Scalar(128, 255, 0)    // DCA
-	};
-
-	for (int j = 0; j < sizeof(boundingBoxLists) / sizeof(boundingBoxLists[0]); j++)
-	{
-		std::vector<BoundingBox>& boundingBoxList = boundingBoxLists[j];
-		cv::Scalar color = colors[j];
-
-		for (int i = 0; i < boundingBoxList.size(); i++)
-		{
-			BoundingBox lastBox = boundingBoxList[i];
-			BoundingBox rescaleBox(-1, -1, -1, -1, -1);
-
-			utils::rescaleBBox(
-			lastBox, rescaleBox,
-			m_config->modelWidth, m_config->modelHeight,
-			m_config->frameWidth, m_config->frameHeight);
-
-			imgUtil::roundedRectangle(
-				m_dsp_img, cv::Point(rescaleBox.x1, rescaleBox.y1),
-				cv::Point(rescaleBox.x2, rescaleBox.y2),
-				color, 2, 0, 10, false);
-		}
-	}
 }
 
 void ADAS::_drawBoundingBoxes()
@@ -1620,10 +1776,19 @@ void ADAS::_drawBoundingBoxes()
 			BoundingBox lastBox = boundingBoxList[i];
 			BoundingBox rescaleBox(-1, -1, -1, -1, -1);
 
+			#ifdef QCS6490
 			utils::rescaleBBox(
 			lastBox, rescaleBox,
 			m_config->modelWidth, m_config->modelHeight,
 			m_config->frameWidth, m_config->frameHeight);
+			#endif
+
+			#ifdef SAV837
+			utils::rescaleBBox(
+			lastBox, rescaleBox,
+			m_config->modelWidth, m_config->modelHeight,
+			m_config->frameWidth, m_config->frameHeight);
+			#endif
 
 			imgUtil::roundedRectangle(
 				m_dsp_img, cv::Point(rescaleBox.x1, rescaleBox.y1),
@@ -1778,6 +1943,14 @@ void ADAS::_drawTrackedObjects()
 			}
 		}
 	}
+
+	if (m_dsp_vanishingLine)
+#ifdef QCS6490
+		cv::line(m_dsp_img, cv::Point(0, m_yVanish), cv::Point(m_videoWidth, m_yVanish), cv::Scalar(255, 255, 255), 2);
+#endif
+#ifdef SAV837
+		cv::line(m_dsp_img, cv::Point(0, m_yVanish), cv::Point(m_videoWidth, m_yVanish), cv::Scalar(255, 255, 255), 2);
+#endif
 }
 
 #ifdef SAV837
@@ -1808,43 +1981,64 @@ cv::Mat convertRGBToARGB(const cv::Mat& rgbImage)
 }
 #endif
 
+void ADAS::_drawCrossWalk()
+{
+	cv::resize(m_dsp_calibMask, m_dsp_calibMask, cv::Size(m_dsp_img.cols, m_dsp_img.rows), cv::INTER_LINEAR);
+	cv::addWeighted(m_dsp_img, 1.0, m_dsp_calibMask, 0.7, 0.0, m_dsp_img);
+}
 
 void ADAS::_drawLaneLines()
 {
 	#ifdef SAV837
 	utils::rescaleLine(
-		m_fcw->m_vehicleZone, m_rescaleVehicleZone,
+		m_fcw->m_vehicleZone, m_rescaleVehicleROI,
 		m_config->modelWidth, m_config->modelHeight,
 		m_config->frameWidth, m_config->frameHeight);
 	#endif
 
 	#ifdef QCS6490
 	utils::rescaleLine(
-		m_fcw->m_vehicleZone, m_rescaleVehicleZone,
+		m_fcw->m_vehicleZone, m_rescaleVehicleROI,
 		m_config->modelWidth, m_config->modelHeight,
 		m_config->frameWidth, m_config->frameHeight);
 	#endif
 
+	// if (m_dsp_warningZone)
+	// {
+	// 	#ifdef SAV837
+	// 	utils::rescaleLine(
+	// 		m_fcw->m_riderZone, m_rescaleRiderROI,
+	// 		m_config->modelWidth, m_config->modelHeight,
+	// 		m_config->frameWidth, m_config->frameHeight);
+
+	// 	utils::rescaleLine(
+	// 		m_fcw->m_humanZone, m_rescaleHumanROI,
+	// 		m_config->modelWidth, m_config->modelHeight,
+	// 		m_config->frameWidth, m_config->frameHeight);
+	// 	#endif
+
+	// 	#ifdef QCS6490
+	// 	utils::rescaleLine(
+	// 		m_fcw->m_riderZone, m_rescaleRiderROI,
+	// 		m_config->modelWidth, m_config->modelHeight,
+	// 		m_videoROIWidth, m_videoROIHeight);
+
+	// 	utils::rescaleLine(
+	// 		m_fcw->m_humanZone, m_rescaleHumanROI,
+	// 		m_config->modelWidth, m_config->modelHeight,
+	// 		m_videoROIWidth, m_videoROIHeight);
+	// 	#endif
+	// }
+
 	m_dsp_laneLineResult = cv::Mat::zeros(m_dsp_img.rows, m_dsp_img.cols, CV_8UC3); // QD: Change to m_dsp_img for avoiding manual change
 
-	// cout << "m_videoROIWidth = " << m_videoROIWidth << endl;
-	// cout << "m_videoROIHeight = " << m_videoROIHeight << endl;
-	// cout << "m_rescaleVehicleZone.pLeftFar.x = " << m_rescaleVehicleZone.pLeftFar.x << endl;
-	// cout << "m_rescaleVehicleZone.pLeftFar.y = " << m_rescaleVehicleZone.pLeftFar.y << endl;
-	// cout << "m_rescaleVehicleZone.pLeftCarhood.x = " << m_rescaleVehicleZone.pLeftCarhood.x << endl;
-	// cout << "m_rescaleVehicleZone.pLeftCarhood.y = " << m_rescaleVehicleZone.pLeftCarhood.y << endl;
-	// cout << "m_rescaleVehicleZone.pRightFar.x = " << m_rescaleVehicleZone.pRightFar.x << endl;
-	// cout << "m_rescaleVehicleZone.pRightFar.y = " << m_rescaleVehicleZone.pRightFar.y << endl;
-	// cout << "m_rescaleVehicleZone.pRightCarhood.x = " << m_rescaleVehicleZone.pRightCarhood.x << endl;
-	// cout << "m_rescaleVehicleZone.pRightCarhood.y = " << m_rescaleVehicleZone.pRightCarhood.y << endl;
-
-	if (m_rescaleVehicleZone.pLeftFar.y != 0 && m_rescaleVehicleZone.pRightFar.y != 0)
+	if (m_rescaleVehicleROI.pLeftFar.y != 0 && m_rescaleVehicleROI.pRightFar.y != 0)
 	{
 		std::vector<cv::Point> fillContSingle;
-		fillContSingle.push_back(m_rescaleVehicleZone.pLeftFar);
-		fillContSingle.push_back(m_rescaleVehicleZone.pRightFar);
-		fillContSingle.push_back(m_rescaleVehicleZone.pRightCarhood);
-		fillContSingle.push_back(m_rescaleVehicleZone.pLeftCarhood);
+		fillContSingle.push_back(m_rescaleVehicleROI.pLeftFar);
+		fillContSingle.push_back(m_rescaleVehicleROI.pRightFar);
+		fillContSingle.push_back(m_rescaleVehicleROI.pRightCarhood);
+		fillContSingle.push_back(m_rescaleVehicleROI.pLeftCarhood);
 
 		if (m_isLaneDeparture)
 			cv::fillPoly(m_dsp_laneLineResult, std::vector<std::vector<cv::Point>>{fillContSingle}, cv::Scalar(0, 0, 255));
@@ -1853,34 +2047,18 @@ void ADAS::_drawLaneLines()
 
 		cv::addWeighted(m_dsp_img, 1.0, m_dsp_laneLineResult, 0.7, 0, m_dsp_img);
 
-		cv::line(m_dsp_img, m_rescaleVehicleZone.pLeftFar, m_rescaleVehicleZone.pLeftCarhood, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
-		cv::line(m_dsp_img, m_rescaleVehicleZone.pRightFar, m_rescaleVehicleZone.pRightCarhood, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+		cv::line(m_dsp_img, m_rescaleVehicleROI.pLeftFar, m_rescaleVehicleROI.pLeftCarhood, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
+		cv::line(m_dsp_img, m_rescaleVehicleROI.pRightFar, m_rescaleVehicleROI.pRightCarhood, cv::Scalar(255, 255, 255), 2, cv::LINE_AA);
 
 		// if (m_dsp_warningZone)
 		// {
-		// 	cv::line(m_dsp_img, m_rescaleRiderZone.pLeftFar, m_rescaleRiderZone.pLeftCarhood, cv::Scalar(0, 128, 255), 2, cv::LINE_AA);
-		// 	cv::line(m_dsp_img, m_rescaleRiderZone.pRightFar, m_rescaleRiderZone.pRightCarhood, cv::Scalar(0,128, 255), 2, cv::LINE_AA);
+		// 	cv::line(m_dsp_img, m_rescaleRiderROI.pLeftFar, m_rescaleRiderROI.pLeftCarhood, cv::Scalar(0, 128, 255), 2, cv::LINE_AA);
+		// 	cv::line(m_dsp_img, m_rescaleRiderROI.pRightFar, m_rescaleRiderROI.pRightCarhood, cv::Scalar(0,128, 255), 2, cv::LINE_AA);
 
-		// 	cv::line(m_dsp_img, m_rescaleHumanZone.pLeftFar, m_rescaleHumanZone.pLeftCarhood, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
-		// 	cv::line(m_dsp_img, m_rescaleHumanZone.pRightFar, m_rescaleHumanZone.pRightCarhood, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+		// 	cv::line(m_dsp_img, m_rescaleHumanROI.pLeftFar, m_rescaleHumanROI.pLeftCarhood, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+		// 	cv::line(m_dsp_img, m_rescaleHumanROI.pRightFar, m_rescaleHumanROI.pRightCarhood, cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
 		// }
-
-		// Driving Direction Vector
-		if (m_isDetectLine && m_laneLineInfo.drivingDirectionVector.size() > 0)
-		{
-			for (int i=0; i<m_laneLineInfo.drivingDirectionVector.size(); i++)
-			{
-				utils::rescalePoint(
-					m_laneLineInfo.drivingDirectionVector[i], m_laneLineInfo.drivingDirectionVector[i],
-					m_config->modelWidth, m_config->modelHeight,
-					m_videoWidth, m_videoHeight);
-			}
-			cv::arrowedLine(m_dsp_img, m_laneLineInfo.drivingDirectionVector[0], m_laneLineInfo.drivingDirectionVector[1], cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
-		}
 	}
-
-	if (m_dsp_vanishingLine)
-		cv::line(m_dsp_img, cv::Point(0, m_yVanish), cv::Point(m_videoWidth, m_yVanish), cv::Scalar(255, 255, 255), 2);
 }
 
 void ADAS::_drawInformation()
@@ -1892,20 +2070,23 @@ void ADAS::_drawInformation()
     cv::putText(m_dsp_imgResize, "Frame: " + std::to_string(m_frameIdx), cv::Point(10, 500),
                 cv::FONT_HERSHEY_COMPLEX_SMALL, 0.8, cv::Scalar(0, 255, 0), 1, 2, 0);
 
-    cv::putText(m_dsp_imgResize, "Vanishing Line: " + std::to_string(m_yVanish), cv::Point(10, 520),
-                cv::FONT_HERSHEY_COMPLEX_SMALL, 0.8, cv::Scalar(0, 255, 0), 1, 2, 0);
-
-    cv::putText(m_dsp_imgResize, "Direction: " + m_egoDirectionInfo.directionStr, cv::Point(10, 540),
+    cv::putText(m_dsp_imgResize, "Direction: " + m_egoDirectionInfo.directionStr, cv::Point(10, 520),
                 cv::FONT_HERSHEY_COMPLEX_SMALL, 0.8, cv::Scalar(0, 255, 0), 1, 3, 0);
 
-    cv::putText(m_dsp_imgResize, "Direction Degree: " + std::to_string(m_laneLineInfo.drivingDirectionDegree),
+    cv::putText(m_dsp_imgResize, "Vanishing Line: " + std::to_string(m_yVanish), cv::Point(10, 540),
+                cv::FONT_HERSHEY_COMPLEX_SMALL, 0.8, cv::Scalar(0, 255, 0), 1, 2, 0);
+
+    cv::putText(m_dsp_imgResize, "Motion (Right) = " + std::to_string(m_egoDirectionInfo.avg_xOffsetRight),
                 cv::Point(10, 560), cv::FONT_HERSHEY_COMPLEX_SMALL, 0.8, cv::Scalar(0, 255, 0), 1, 2, 0);
 
-    cv::putText(m_dsp_imgResize, "Left Line Angle: " + std::to_string(m_currLaneInfo.leftDegree),
+    cv::putText(m_dsp_imgResize, "Motion (Left) = " + std::to_string(m_egoDirectionInfo.avg_xOffsetLeft),
                 cv::Point(10, 580), cv::FONT_HERSHEY_COMPLEX_SMALL, 0.8, cv::Scalar(0, 255, 0), 1, 2, 0);
 
-    cv::putText(m_dsp_imgResize, "Right Line Angle: " + std::to_string(m_currLaneInfo.rightDegree),
+    cv::putText(m_dsp_imgResize, "Left Line Angle = " + std::to_string(m_unscale_currLaneInfo.leftDegree),
                 cv::Point(10, 600), cv::FONT_HERSHEY_COMPLEX_SMALL, 0.8, cv::Scalar(0, 255, 0), 1, 2, 0);
+
+    cv::putText(m_dsp_imgResize, "Right Line Angle = " + std::to_string(m_unscale_currLaneInfo.rightDegree),
+                cv::Point(10, 620), cv::FONT_HERSHEY_COMPLEX_SMALL, 0.8, cv::Scalar(0, 255, 0), 1, 2, 0);
 
 	if (m_isLaneDeparture && m_dsp_laneDeparture)
 	{
@@ -1920,34 +2101,76 @@ void ADAS::_drawInformation()
 	}
 }
 
+void ADAS::_drawLaneLineMasks()
+{
+	std::vector<cv::Mat> laneMaskList;
+	std::vector<cv::Mat> lineMaskList;
+
+	for (int i = 0; i < 3; i++)
+	{
+		laneMaskList.push_back(m_laneMask);
+		lineMaskList.push_back(m_dsp_mergeLineMask);
+	}
+
+	cv::Mat laneMask3C;
+	cv::Mat lineMask3C;
+	const int additional_height = 160;
+	const int mask_width = m_dsp_imgResize.rows / 4;
+
+	cv::merge(laneMaskList, laneMask3C);
+	cv::merge(lineMaskList, lineMask3C);
+
+	cv::resize(m_dsp_colorLaneMask, m_dsp_colorLaneMask, cv::Size(mask_width, additional_height), cv::INTER_LINEAR);
+	cv::resize(laneMask3C, laneMask3C, cv::Size(mask_width, additional_height), cv::INTER_LINEAR);
+	cv::resize(m_dsp_colorLineMask, m_dsp_colorLineMask, cv::Size(mask_width, additional_height), cv::INTER_LINEAR);
+	cv::resize(lineMask3C, lineMask3C, cv::Size(mask_width, additional_height), cv::INTER_LINEAR);
+
+	cv::Mat dbgLaneMasks;
+	cv::Mat dbgLineMasks;
+	cv::Mat dbgMasks;
+	cv::hconcat(m_dsp_colorLaneMask, laneMask3C, dbgLaneMasks);
+	cv::hconcat(m_dsp_colorLineMask, lineMask3C, dbgLineMasks);
+	cv::hconcat(dbgLaneMasks, dbgLineMasks, dbgMasks);
+
+	cv::Mat imgNew = cv::Mat(cv::Size(m_dsp_imgResize.cols, m_dsp_imgResize.rows + additional_height), CV_8UC3, cv::Scalar::all(0));
+
+	m_dsp_imgResize.copyTo(imgNew(cv::Rect(0, 0, m_dsp_imgResize.cols, m_dsp_imgResize.rows)));
+	dbgMasks.copyTo(imgNew(cv::Rect(0, m_dsp_imgResize.rows, dbgMasks.cols, dbgMasks.rows)));
+	m_dsp_imgResize = imgNew.clone();
+}
+
+void ADAS::_drawLaneMasks()
+{
+	cv::resize(m_dsp_colorLaneMask, m_dsp_colorLaneMask, m_dsp_imgResize.size(), cv::INTER_LINEAR);
+	cv::addWeighted(m_dsp_imgResize, 1.0, m_dsp_colorLaneMask, 0.5, 0.0, m_dsp_imgResize);
+}
 
 void ADAS::_drawResults()
 {
 	int waitKey = 1;
+	if (m_dsp_laneDeparture)
+		_drawLDWROI();
+
 	if (m_dsp_objectDetection)
-	{
 		_drawBoundingBoxes();
-	}
 
 	if (m_dsp_objectTracking)
 		_drawTrackedObjects();
 
 	if (m_dsp_laneLineDetection)
-	{
 		_drawLaneLines();
-	}
-
-	//TODO: turn it by setting header file only
-	//TODO: develop purpose only don't want others know how we detect lane lines
-	if (m_dsp_laneLineBoxes)
-	{
-		_drawLaneLineBoundingBoxes();
-	}
 
 	cv::resize(m_dsp_img, m_dsp_imgResize, cv::Size(1280, 720), cv::INTER_LINEAR); // Width must be mutiplication of 4
 
 	if (m_dsp_information)
 		_drawInformation();
+
+	if (m_dsp_laneLineMask)
+	{
+        if (!(m_laneMask.empty() || m_dsp_colorLaneMask.empty() || m_dsp_colorLineMask.empty()
+              || m_dsp_mergeLineMask.empty()))
+			_drawLaneLineMasks();
+	}
 
 	// m_drawResultBuffer.back().matResult = m_dsp_imgResize.clone();
 	#ifndef SAV837

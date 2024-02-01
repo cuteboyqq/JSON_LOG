@@ -34,7 +34,6 @@
 #include "yolo_adas_postproc.hpp"
 #include "matching2D.hpp"
 #include "lane_finder.hpp"
-#include "lane_line_det.hpp"
 #include "optical_flow.hpp"
 #include "object_tracker.hpp"
 #include "json_log.hpp"
@@ -121,7 +120,9 @@ class ADAS
 		void stopThread();
 
 		// === Work Flow === //
+		bool _calcEgoDirection();
 		bool _modelInfernece();
+		bool _getLaneLineMasks();
 		bool _laneLineDetection();
 		bool _objectDetection();
 		bool _objectTracking();
@@ -217,10 +218,12 @@ class ADAS
 		// === Debug === //
 		void _drawLaneDetector();
 		void _drawBoundingBoxes();
-		void _drawLaneLineBoundingBoxes();
 		void _drawTrackedObjects();
 		void _drawLaneLines();
+		void _drawCrossWalk();
 		void _drawInformation();
+		void _drawLaneLineMasks();
+		void _drawLaneMasks();
 
 
 		// === Config === //
@@ -269,6 +272,9 @@ class ADAS
 
 
 		// === Input Frame === //
+		cv::Mat m_laneMask;
+		cv::Mat m_lineMask;
+		cv::Mat m_horiLineMask; //TODO:
 
 		// === Bounding Box === //
 
@@ -286,14 +292,6 @@ class ADAS
 		std::vector<BoundingBox> m_f_stopSignBBoxList;
 		std::vector<BoundingBox> m_f_roadSignBBoxList;
 
-		// Output Bounding Boxes for Lane Information
-		std::vector<BoundingBox> m_vlaBBoxList;
-		std::vector<BoundingBox> m_vpaBBoxList;
-		std::vector<BoundingBox> m_dlaBBoxList;
-		std::vector<BoundingBox> m_dmaBBoxList;
-		std::vector<BoundingBox> m_duaBBoxList;
-		std::vector<BoundingBox> m_dcaBBoxList;
-
 		// === Objects === //
 		std::vector<Object> m_humanObjList;
 		std::vector<Object> m_riderObjList;
@@ -310,6 +308,7 @@ class ADAS
 		DirectionInfo m_egoDirectionInfo;
 
 		// === Lane Line Detection === //
+		LaneFinder* m_laneFinder;
 		vector<Point> m_linePointList;
 		LaneLineInfo m_laneLineInfo;
 		LaneInfo m_currLaneInfo;
@@ -322,7 +321,6 @@ class ADAS
 		bool m_isRightLineShift = false;
 		float m_leftLineShiftRatio = 0;
 		float m_rightLineShiftRatio = 0;
-		LaneLineDetection* m_laneLineDet;
 
 		// === Following Distance === //
 		float m_focalRescaleRatio = 0;
@@ -337,8 +335,8 @@ class ADAS
 		FCW* m_fcw;
 		bool m_isForwardCollision = false;
 		BoundingBox* m_OD_ROI;
-		ROI m_rescaleVehicleZone;
-		ROI m_rescaleRiderZone;
+		ROI m_rescaleVehicleROI;
+		ROI m_rescaleRiderROI;
 		ROI m_rescaleHumanROI;
 		ROI m_roi;
 		BoundingBox* m_roiBBox;
@@ -357,17 +355,16 @@ class ADAS
 		cv::Mat m_dsp_laneLineResult;
 		cv::Mat m_dsp_mergeLineMask; //TODO:
 		
-		bool m_dsp_laneLineMask = true;
-		bool m_dsp_objectDetection = true;
-		bool m_dsp_objectTracking = true;
-		bool m_dsp_laneLineDetection = true;
-		bool m_dsp_laneLineBoxes = true;
-		bool m_dsp_vanishingLine = true;
-		bool m_dsp_followingDistance = true;
-		bool m_dsp_laneDeparture = true;
-		bool m_dsp_forwardCollision = true;
-		bool m_dsp_warningZone = true;
-		bool m_dsp_information = true;
+		bool m_dsp_laneLineMask = false;
+		bool m_dsp_objectDetection = false;
+		bool m_dsp_objectTracking = false;
+		bool m_dsp_laneLineDetection = false;
+		bool m_dsp_vanishingLine = false;
+		bool m_dsp_followingDistance = false;
+		bool m_dsp_laneDeparture = false;
+		bool m_dsp_forwardCollision = false;
+		bool m_dsp_warningZone = false;
+		bool m_dsp_information = false;
 		int m_dsp_maxFrameIdx;
 
 		// === Debug === //
