@@ -47,6 +47,17 @@ public:
 							  std::vector<Object> m_trackedObjList,
 							  int m_frameIdx);
 
+
+	std::string JsonLogString_2(ADAS_Results adasResult,
+							  ADAS_Config_S* m_config,
+							  std::vector<BoundingBox> m_humanBBoxList,
+							  std::vector<BoundingBox> m_riderBBoxList,
+							  std::vector<BoundingBox> m_vehicleBBoxList,
+							  std::vector<BoundingBox> m_roadSignBBoxList,
+							  std::vector<BoundingBox> m_stopSignBBoxList,
+							  std::vector<Object> m_trackedObjList,
+							  int m_frameIdx);
+
 	void SaveJsonLogFile(std::string jsonString);
 
 	std::string GetJsonValueByKey(int targetFrameID);
@@ -62,7 +73,10 @@ private:
 	bool SaveLaneInfoLog = true;
 	bool SaveDetObjLog = true;
 	bool SaveVanishLineLog = true;
-	bool SaveToJSONFile = true;
+	bool SaveToJSONFile = false;
+	bool SaveLDWLog = true;
+	bool SaveFCWLog = true;
+	
 	std::string jsonString;
 	std::string jsonFile;
 };

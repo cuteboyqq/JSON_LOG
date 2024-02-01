@@ -942,11 +942,20 @@ bool ADAS::run(cv::Mat &imgFrame, cv::Mat &resultMat)
 		m_stopSignBBoxList
 	};
 	JSON_LOG json_log("output.json");
-	std::string json_log_str = json_log.JsonLogString(adasResult, 
-													  m_config, 
-													  boundingBoxLists, 
-													  m_trackedObjList, 
-													  m_frameIdx);
+	// std::string json_log_str = json_log.JsonLogString(adasResult, 
+	// 												  m_config, 
+	// 												  boundingBoxLists, 
+	// 												  m_trackedObjList, 
+	// 												  m_frameIdx);
+	std::string json_log_str = json_log.JsonLogString_2(adasResult,
+														m_config,
+														m_humanBBoxList,
+														m_riderBBoxList,
+														m_vehicleBBoxList,
+														m_roadSignBBoxList,
+														m_stopSignBBoxList,
+														m_trackedObjList,
+														m_frameIdx);
 	// std::string json_log_frameID_str = json_log.GetJsonValueByKey(87);
 	// cout<<"==========================================================================="<<endl;
 	// cout<<json_log_str<<endl;
